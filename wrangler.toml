@@ -9,3 +9,11 @@ zone_name = "proagentstore.online"
 
 [triggers]
 crons = ["0 8 * * *"]
+
+[[durable_objects.bindings]]
+name = "LEADS"
+class_name = "LeadsDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LeadsDO"]
