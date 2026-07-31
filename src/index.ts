@@ -112,15 +112,23 @@ export class LeadsDO {
 			scanned.push(idx);
 			const places = await this.searchNearby(cell.lat, cell.lng, type, key);
 			searched++;
+			// New (not-yet-stored) places only, then reachability-check their sites CONCURRENTLY
+			// (bounds wall-clock vs. sequential timeouts; keeps us under Worker limits).
+			const fresh: any[] = [];
 			for (const p of places) {
 				seen++;
+				if (!p.id) continue;
+				if (await this.state.storage.get(`lead:${p.id}`)) continue; // dedupe
+				fresh.push(p);
+			}
+			const reach = await Promise.all(fresh.map((p) => (p.websiteUri ? reachable(p.websiteUri) : Promise.resolve(true))));
+			for (let j = 0; j < fresh.length; j++) {
+				const p = fresh[j];
 				const placeId: string = p.id;
-				if (!placeId) continue;
-				if (await this.state.storage.get(`lead:${placeId}`)) continue; // dedupe
 				const site: string | undefined = p.websiteUri;
 				let websiteStatus: "none" | "unreachable" | null = null;
 				if (!site) websiteStatus = "none";
-				else if (!(await reachable(site))) websiteStatus = "unreachable";
+				else if (!reach[j]) websiteStatus = "unreachable";
 				else { skippedHasSite++; continue; } // has a working site → not a lead
 				const lead: Lead = {
 					place_id: placeId,
