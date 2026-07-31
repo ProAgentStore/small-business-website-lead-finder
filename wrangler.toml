@@ -1,0 +1,11 @@
+name = "proagentstore-small-business-website-lead-finder"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[routes]]
+pattern = "small-business-website-lead-finder.proagentstore.online/*"
+zone_name = "proagentstore.online"
+
+[triggers]
+crons = ["0 8 * * *"]
