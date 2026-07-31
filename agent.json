@@ -1,0 +1,17 @@
+{
+  "id": "small-business-website-lead-finder",
+  "name": "Small Business Website Lead Finder",
+  "description": "Finds local small businesses with no website — or a broken, unreachable one — on Google, and compiles them as ready-to-pitch leads for website building. Search by city and business type; exports name, address, phone, and Maps link.",
+  "storeType": "worker",
+  "category": "Sales",
+  "model": "@cf/meta/llama-3.2-3b-instruct",
+  "template": "cron",
+  "serverConfig": {
+    "durableObject": false,
+    "cron": "0 8 * * *",
+    "routes": [
+      "small-business-website-lead-finder.proagentstore.online/*"
+    ],
+    "aiBilling": "caller-provided"
+  }
+}
