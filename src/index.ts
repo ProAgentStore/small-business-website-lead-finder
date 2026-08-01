@@ -92,6 +92,10 @@ export class LeadsDO {
 				const by = (k: string) => leads.filter((l) => l.website_status === k).length;
 				return json({ total: leads.length, none: by("none"), unreachable: by("unreachable"), cursor, totalCells: cells().length, city: GRID.city });
 			}
+			if (url.pathname === "/reset") {
+				await this.state.storage.deleteAll();
+				return json({ ok: true, reset: true });
+			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
 			return json({ error: String((e as Error).message || e) }, 500);
@@ -121,7 +125,7 @@ export class LeadsDO {
 				if (await this.state.storage.get(`lead:${p.id}`)) continue; // dedupe
 				fresh.push(p);
 			}
-			const reach = await Promise.all(fresh.map((p) => (p.websiteUri ? reachable(p.websiteUri) : Promise.resolve(true))));
+			const reach = await mapLimit(fresh, 6, (p) => (p.websiteUri ? reachable(p.websiteUri) : Promise.resolve(true)));
 			for (let j = 0; j < fresh.length; j++) {
 				const p = fresh[j];
 				const placeId: string = p.id;
@@ -174,13 +178,40 @@ export class LeadsDO {
 	}
 }
 
-// A listed website is a "lead" if it does NOT load. GET with a short timeout; any error or
-// >=400 counts as unreachable.
+// Run `fn` over items with bounded concurrency (avoids firing dozens of fetches at once,
+// which caused queued-fetch timeouts → false "unreachable").
+async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+	const out: R[] = new Array(items.length);
+	let i = 0;
+	const worker = async () => {
+		while (i < items.length) {
+			const idx = i++;
+			out[idx] = await fn(items[idx]);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return out;
+}
+
+// Reachability, conservative: returns false (= a "site down" LEAD) ONLY on a definitive dead
+// signal (HTTP 404/410/5xx). Any other outcome — 2xx/3xx/401/403/429, a timeout, or a connection
+// error — is treated as reachable, so we never pitch "your site is down" to a business whose site
+// is actually fine (the earlier bug flagged ~75% of live sites). Browser UA + one retry + 12s.
 async function reachable(rawUrl: string): Promise<boolean> {
-	try {
-		const res = await fetch(rawUrl, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(6000) });
-		return res.status < 400;
-	} catch {
-		return false;
+	const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			const res = await fetch(rawUrl, {
+				method: "GET",
+				redirect: "follow",
+				headers: { "User-Agent": UA, Accept: "text/html,*/*" },
+				signal: AbortSignal.timeout(12000),
+			});
+			if (res.status === 404 || res.status === 410 || res.status >= 500) return false; // definitively dead
+			return true; // any other response → site is up
+		} catch {
+			if (attempt === 1) return true; // timeout / connection error → ambiguous, don't false-flag
+		}
 	}
+	return true;
 }
