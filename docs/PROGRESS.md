@@ -2,6 +2,25 @@
 
 Newest first. The running record of everything we work on for this agent.
 
+## 2026-08-01 — Shipped: sweep live, reachability fixed, published
+- Implemented the sweep worker (Places API New searchNearby + inline websiteUri FieldMask,
+  DO storage, dedupe, grid over inner Melbourne, token-guarded /sweep /leads /stats /reset).
+- Wired secrets on the worker: `GOOGLE_PLACES_API_KEY` (from SOPS) + `SBWLF_SWEEP_TOKEN`
+  (persisted to SOPS `pags.SBWLF_SWEEP_TOKEN`).
+- **Reachability bug fixed:** first pass flagged ~75% of live sites "unreachable" (short-timeout
+  concurrent fetches). Now conservative: only flag on definitive 404/410/5xx, browser UA + retry,
+  bounded concurrency. Re-swept clean: **72 leads from 24/48 cells — 60 no-website, 12 genuinely
+  dead** (spot-checked: 9/11 hard-dead, 2 dead-after-redirect).
+- **Published** the agent; created an instance (`933ebec5-3e84-492e-8d7c-e1d575e67ef1`).
+- Platform: fixed the console model picker (was @cf/* local only) to offer the Claude family,
+  default Sonnet 4.6 — deployed to prod.
+- **View leads:** `https://small-business-website-lead-finder.proagentstore.online/leads?status=none&token=<SBWLF_SWEEP_TOKEN>`
+
+### Next
+- [ ] Sweep the remaining cells (cursor 24/48) — daily cron advances it; tune cron batch to plan limits.
+- [ ] Surface leads in the instance chat (currently only via the /leads endpoint).
+- [ ] Generalise beyond `type=cafe` (parameterise business types) + more metros.
+
 ## 2026-08-01 — Places API key provisioned & tested
 - GCP project **proappstore-online**: linked billing (Firebase Payment `015CE5-BF7BF9-9EF996`,
   after "My Billing Account" hit a project-quota block), enabled **Places API (New)**, created a
