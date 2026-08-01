@@ -163,6 +163,7 @@ export class LeadsDO {
 		const key = this.env.GOOGLE_PLACES_API_KEY;
 		if (!key) return { error: "GOOGLE_PLACES_API_KEY not set" };
 		const geo = await this.geocode(city, key);
+		const cityLabel = city.split(",")[0].trim(); // "Sydney, Australia" → "Sydney" (the metro)
 		const all = cellsAround(geo.center);
 		const ckey = `cursor:${city}:${type}`;
 		let cursor = (await this.state.storage.get<number>(ckey)) ?? 0;
@@ -225,8 +226,8 @@ export class LeadsDO {
 					category: type,
 					country: pg.country || geo.country,
 					state: pg.state || geo.state,
-					city: pg.city || geo.cityName,
-					suburb: pg.suburb,
+					city: cityLabel,
+					suburb: pg.sublocality || pg.locality,
 					address: addr,
 					phone,
 					phone_type: ptype,
@@ -270,7 +271,7 @@ export class LeadsDO {
 	}
 }
 
-function geoFromComponents(comps: any[]): { country: string; state: string; city: string; suburb: string } {
+function geoFromComponents(comps: any[]): { country: string; state: string; locality: string; sublocality: string } {
 	const get = (t: string) => {
 		const c = comps.find((x) => (x.types || []).includes(t));
 		return c ? c.longText || c.shortText || "" : "";
@@ -278,8 +279,9 @@ function geoFromComponents(comps: any[]): { country: string; state: string; city
 	return {
 		country: get("country"),
 		state: get("administrative_area_level_1"),
-		city: get("locality") || get("postal_town") || get("administrative_area_level_2"),
-		suburb: get("sublocality") || get("sublocality_level_1") || get("neighborhood") || "",
+		// In AU `locality` IS the suburb (Newtown); in the US it's the city (Austin).
+		locality: get("locality") || get("postal_town") || get("administrative_area_level_2"),
+		sublocality: get("sublocality") || get("sublocality_level_1") || get("neighborhood") || "",
 	};
 }
 
