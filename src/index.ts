@@ -153,7 +153,7 @@ export class LeadsDO {
 			center: { lat: p.location.latitude, lng: p.location.longitude },
 			country: g.country,
 			state: g.state,
-			cityName: g.city || p.displayName?.text || city,
+			cityName: g.locality || p.displayName?.text || city,
 		};
 		await this.state.storage.put(`geo:${city}`, out);
 		return out;
