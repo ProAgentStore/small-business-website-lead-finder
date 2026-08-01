@@ -1,46 +1,69 @@
-// Small Business Website Lead Finder — scheduled sweep.
+// Small Business Website Lead Finder — scheduled + on-demand sweep, any city.
 //
-// Finds local small businesses whose Google listing has NO website, or a listed-but-
-// unreachable one, and stores them as leads. Deterministic code (no LLM): grid-tile a
-// metro → Places API (New) searchNearby with a FieldMask that returns websiteUri inline
-// (so no separate Place Details call) → classify → reachability-check → dedupe by
-// place_id → persist in this Durable Object's storage.
+// Deterministic (no LLM): geocode a city → tile a grid around its centre → Places API (New)
+// searchNearby (websiteUri + addressComponents inline, so no separate Details call) →
+// classify (no website / unreachable) → reachability-check → dedupe by place_id →
+// persist to this Durable Object with a full per-lead AUDIT trail.
 //
-// Endpoints (proxied to the DO):
-//   GET  /                              → status
-//   POST /sweep?type=cafe&batch=3       → run `batch` grid cells now (manual pilot)
-//   GET  /leads?status=none&limit=200   → list stored leads
-//   GET  /stats                         → counts
-// scheduled(): advances the grid a few cells per tick so a run never blows the quota.
+// Endpoints (token-guarded, proxied to the DO):
+//   GET  /
+//   POST /sweep?city=Sydney&type=cafe&batch=4   → run `batch` grid cells of that city now
+//   GET  /leads?city=Sydney&status=none&limit=1000
+//   GET  /stats
+//   POST /reset
 
 export interface Env {
 	LEADS: DurableObjectNamespace;
 	GOOGLE_PLACES_API_KEY?: string;
-	SWEEP_TOKEN?: string; // shared secret guarding /sweep (spends money), /leads, /stats
+	SWEEP_TOKEN?: string;
 }
 
-// ── Pilot metro grid: inner Melbourne (CBD + inner suburbs) ──
-const GRID = {
-	city: "Melbourne, AU",
-	latMin: -37.855, latMax: -37.77,
-	lngMin: 144.93, lngMax: 145.01,
-	stepLat: 0.012, stepLng: 0.015, // ~1.3km spacing
-	radius: 900, // metres per cell
-};
+// Bounded grid extent around a city centre (keeps per-run Places cost sane).
+const EXTENT = { lat: 0.045, lng: 0.055, stepLat: 0.013, stepLng: 0.016, radius: 900 };
 
-function cells(): { lat: number; lng: number }[] {
-	const out: { lat: number; lng: number }[] = [];
-	for (let lat = GRID.latMin; lat <= GRID.latMax; lat += GRID.stepLat)
-		for (let lng = GRID.lngMin; lng <= GRID.lngMax; lng += GRID.stepLng)
+interface Cell {
+	lat: number;
+	lng: number;
+}
+function cellsAround(c: { lat: number; lng: number }): Cell[] {
+	const out: Cell[] = [];
+	for (let lat = c.lat - EXTENT.lat; lat <= c.lat + EXTENT.lat; lat += EXTENT.stepLat)
+		for (let lng = c.lng - EXTENT.lng; lng <= c.lng + EXTENT.lng; lng += EXTENT.stepLng)
 			out.push({ lat: +lat.toFixed(6), lng: +lng.toFixed(6) });
 	return out;
 }
 
+interface AuditStep {
+	at: string;
+	step: string;
+	detail: string;
+}
 interface Lead {
-	place_id: string; name: string; category: string; address: string; phone: string;
-	lat: number; lng: number; maps_url: string;
-	website_status: "none" | "unreachable"; website_url: string;
-	city: string; checked_at: string; status: "new";
+	place_id: string;
+	name: string;
+	category: string;
+	country: string;
+	state: string;
+	city: string;
+	suburb: string;
+	address: string;
+	phone: string;
+	phone_type: string;
+	channels: string;
+	lat: number;
+	lng: number;
+	maps_url: string;
+	website_status: "none" | "unreachable";
+	website_url: string;
+	status: "new";
+	found_at: string;
+	audit: AuditStep[];
+}
+interface Geo {
+	center: { lat: number; lng: number };
+	country: string;
+	state: string;
+	cityName: string;
 }
 
 const json = (data: unknown, status = 200) =>
@@ -48,16 +71,13 @@ const json = (data: unknown, status = 200) =>
 
 export default {
 	async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-		ctx.waitUntil(stub(env).fetch("https://do/sweep?batch=6").then(() => {}));
+		ctx.waitUntil(stub(env).fetch("https://do/sweep?batch=4").then(() => {}));
 	},
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
-		if (url.pathname === "/")
-			return json({ agent: "small-business-website-lead-finder", status: "ok", grid: GRID.city, cells: cells().length });
-		// /sweep spends Places API quota and /leads exposes data — require the shared token.
+		if (url.pathname === "/") return json({ agent: "small-business-website-lead-finder", status: "ok" });
 		if (!env.SWEEP_TOKEN || url.searchParams.get("token") !== env.SWEEP_TOKEN)
 			return json({ error: "unauthorized — pass ?token=" }, 403);
-		// proxy everything else to the singleton DO
 		return stub(env).fetch(new Request("https://do" + url.pathname + url.search, request));
 	},
 };
@@ -67,30 +87,41 @@ function stub(env: Env): DurableObjectStub {
 }
 
 export class LeadsDO {
-	constructor(private state: DurableObjectState, private env: Env) {}
+	constructor(
+		private state: DurableObjectState,
+		private env: Env,
+	) {}
 
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		try {
 			if (url.pathname === "/sweep") {
-				const batch = Math.max(1, Math.min(20, Number(url.searchParams.get("batch") ?? "3")));
+				const batch = Math.max(1, Math.min(12, Number(url.searchParams.get("batch") ?? "3")));
 				const type = url.searchParams.get("type") || "cafe";
-				return json(await this.sweep(batch, type));
+				const city = url.searchParams.get("city") || (await this.state.storage.get<string>("lastCity")) || "Melbourne, Australia";
+				return json(await this.sweep(batch, type, city));
 			}
 			if (url.pathname === "/leads") {
 				const status = url.searchParams.get("status");
-				const limit = Math.min(1000, Number(url.searchParams.get("limit") ?? "200"));
-				const map = await this.state.storage.list<Lead>({ prefix: "lead:", limit: 1000 });
+				const city = url.searchParams.get("city");
+				const limit = Math.min(2000, Number(url.searchParams.get("limit") ?? "500"));
+				const map = await this.state.storage.list<Lead>({ prefix: "lead:", limit: 5000 });
 				let leads = [...map.values()];
 				if (status) leads = leads.filter((l) => l.website_status === status);
+				if (city) leads = leads.filter((l) => (l.city || "").toLowerCase().includes(city.toLowerCase()));
 				return json({ count: leads.length, leads: leads.slice(0, limit) });
 			}
 			if (url.pathname === "/stats") {
-				const map = await this.state.storage.list<Lead>({ prefix: "lead:", limit: 1000 });
+				const map = await this.state.storage.list<Lead>({ prefix: "lead:", limit: 5000 });
 				const leads = [...map.values()];
-				const cursor = (await this.state.storage.get<number>("cursor")) ?? 0;
-				const by = (k: string) => leads.filter((l) => l.website_status === k).length;
-				return json({ total: leads.length, none: by("none"), unreachable: by("unreachable"), cursor, totalCells: cells().length, city: GRID.city });
+				const byCity: Record<string, number> = {};
+				for (const l of leads) byCity[l.city || "?"] = (byCity[l.city || "?"] || 0) + 1;
+				return json({
+					total: leads.length,
+					none: leads.filter((l) => l.website_status === "none").length,
+					unreachable: leads.filter((l) => l.website_status === "unreachable").length,
+					byCity,
+				});
 			}
 			if (url.pathname === "/reset") {
 				await this.state.storage.deleteAll();
@@ -102,13 +133,44 @@ export class LeadsDO {
 		}
 	}
 
-	private async sweep(batch: number, type: string) {
+	private async geocode(city: string, key: string): Promise<Geo> {
+		const cached = await this.state.storage.get<Geo>(`geo:${city}`);
+		if (cached) return cached;
+		const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"X-Goog-Api-Key": key,
+				"X-Goog-FieldMask": "places.location,places.addressComponents,places.displayName",
+			},
+			body: JSON.stringify({ textQuery: city, maxResultCount: 1 }),
+		});
+		if (!res.ok) throw new Error(`geocode ${res.status}: ${(await res.text()).slice(0, 160)}`);
+		const p = ((await res.json()) as { places?: any[] }).places?.[0];
+		if (!p?.location) throw new Error(`could not geocode "${city}"`);
+		const g = geoFromComponents(p.addressComponents || []);
+		const out: Geo = {
+			center: { lat: p.location.latitude, lng: p.location.longitude },
+			country: g.country,
+			state: g.state,
+			cityName: g.city || p.displayName?.text || city,
+		};
+		await this.state.storage.put(`geo:${city}`, out);
+		return out;
+	}
+
+	private async sweep(batch: number, type: string, city: string) {
 		const key = this.env.GOOGLE_PLACES_API_KEY;
 		if (!key) return { error: "GOOGLE_PLACES_API_KEY not set" };
-		const all = cells();
-		let cursor = (await this.state.storage.get<number>("cursor")) ?? 0;
+		const geo = await this.geocode(city, key);
+		const all = cellsAround(geo.center);
+		const ckey = `cursor:${city}:${type}`;
+		let cursor = (await this.state.storage.get<number>(ckey)) ?? 0;
 		const scanned: number[] = [];
-		let searched = 0, added = 0, skippedHasSite = 0, seen = 0;
+		let searched = 0,
+			added = 0,
+			skippedHasSite = 0,
+			seen = 0;
 
 		for (let i = 0; i < batch; i++) {
 			const idx = cursor % all.length;
@@ -116,46 +178,76 @@ export class LeadsDO {
 			scanned.push(idx);
 			const places = await this.searchNearby(cell.lat, cell.lng, type, key);
 			searched++;
-			// New (not-yet-stored) places only, then reachability-check their sites CONCURRENTLY
-			// (bounds wall-clock vs. sequential timeouts; keeps us under Worker limits).
 			const fresh: any[] = [];
 			for (const p of places) {
 				seen++;
 				if (!p.id) continue;
-				if (await this.state.storage.get(`lead:${p.id}`)) continue; // dedupe
+				if (await this.state.storage.get(`lead:${p.id}`)) continue;
 				fresh.push(p);
 			}
-			const reach = await mapLimit(fresh, 6, (p) => (p.websiteUri ? reachable(p.websiteUri) : Promise.resolve(true)));
+			const reach = await mapLimit(fresh, 6, (p) =>
+				p.websiteUri ? reachable(p.websiteUri) : Promise.resolve({ ok: true, code: null as number | null }),
+			);
 			for (let j = 0; j < fresh.length; j++) {
 				const p = fresh[j];
-				const placeId: string = p.id;
 				const site: string | undefined = p.websiteUri;
 				let websiteStatus: "none" | "unreachable" | null = null;
 				if (!site) websiteStatus = "none";
-				else if (!reach[j]) websiteStatus = "unreachable";
-				else { skippedHasSite++; continue; } // has a working site → not a lead
+				else if (!reach[j].ok) websiteStatus = "unreachable";
+				else {
+					skippedHasSite++;
+					continue;
+				}
+				const at = new Date().toISOString();
+				const pg = geoFromComponents(p.addressComponents || []);
+				const phone: string = p.nationalPhoneNumber ?? "";
+				const ptype = classifyPhone(phone);
+				const chans = channelsFor(ptype, phone);
+				const name = p.displayName?.text ?? "";
+				const addr = p.formattedAddress ?? "";
+				const maps = p.googleMapsUri ?? "";
+				const audit: AuditStep[] = [
+					{ at, step: "1. discovered", detail: `Google Places Nearby Search (type=${type}) near ${geo.cityName} at cell (${cell.lat}, ${cell.lng}), 900m radius. place_id=${p.id}.` },
+					{ at, step: "2. raw input", detail: `name=${name} | address=${addr} | phone=${phone || "(none)"} | google website field=${site || "(none)"} | maps=${maps}` },
+					{
+						at,
+						step: "3. website check",
+						detail: site
+							? `GET ${site} (browser UA, 12s, 1 retry) → ${reach[j].code != null ? "HTTP " + reach[j].code : "no response (timeout/DNS)"} → ${websiteStatus === "unreachable" ? "UNREACHABLE" : "reachable"}`
+							: "Google listing has NO website field.",
+					},
+					{ at, step: "4. decision", detail: websiteStatus === "none" ? "QUALIFIED as lead — no website at all." : "QUALIFIED as lead — listed website is down/unreachable." },
+					{ at, step: "5. channels", detail: `phone ${phone || "(none)"} is ${ptype} → reachable via: ${chans}. Social/email not yet researched.` },
+				];
 				const lead: Lead = {
-					place_id: placeId,
-					name: p.displayName?.text ?? "",
+					place_id: p.id,
+					name,
 					category: type,
-					address: p.formattedAddress ?? "",
-					phone: p.nationalPhoneNumber ?? "",
+					country: pg.country || geo.country,
+					state: pg.state || geo.state,
+					city: pg.city || geo.cityName,
+					suburb: pg.suburb,
+					address: addr,
+					phone,
+					phone_type: ptype,
+					channels: chans,
 					lat: p.location?.latitude ?? cell.lat,
 					lng: p.location?.longitude ?? cell.lng,
-					maps_url: p.googleMapsUri ?? "",
+					maps_url: maps,
 					website_status: websiteStatus,
 					website_url: site ?? "",
-					city: GRID.city,
-					checked_at: new Date().toISOString(),
 					status: "new",
+					found_at: at,
+					audit,
 				};
-				await this.state.storage.put(`lead:${placeId}`, lead);
+				await this.state.storage.put(`lead:${p.id}`, lead);
 				added++;
 			}
 			cursor = idx + 1;
 		}
-		await this.state.storage.put("cursor", cursor);
-		return { ok: true, type, cellsScanned: scanned, placesSeen: seen, leadsAdded: added, skippedHasWorkingSite: skippedHasSite, searchCalls: searched, cursor, totalCells: all.length };
+		await this.state.storage.put(ckey, cursor);
+		await this.state.storage.put("lastCity", city);
+		return { ok: true, city: geo.cityName, type, cellsScanned: scanned, placesSeen: seen, leadsAdded: added, skippedHasWorkingSite: skippedHasSite, searchCalls: searched, cursor, totalCells: all.length };
 	}
 
 	private async searchNearby(lat: number, lng: number, type: string, key: string): Promise<any[]> {
@@ -164,22 +256,47 @@ export class LeadsDO {
 			headers: {
 				"Content-Type": "application/json",
 				"X-Goog-Api-Key": key,
-				"X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.location,places.googleMapsUri",
+				"X-Goog-FieldMask":
+					"places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.location,places.googleMapsUri,places.addressComponents",
 			},
 			body: JSON.stringify({
 				includedTypes: [type],
 				maxResultCount: 20,
-				locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius: GRID.radius } },
+				locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius: EXTENT.radius } },
 			}),
 		});
 		if (!res.ok) throw new Error(`Places ${res.status}: ${(await res.text()).slice(0, 200)}`);
-		const data = (await res.json()) as { places?: any[] };
-		return data.places ?? [];
+		return ((await res.json()) as { places?: any[] }).places ?? [];
 	}
 }
 
-// Run `fn` over items with bounded concurrency (avoids firing dozens of fetches at once,
-// which caused queued-fetch timeouts → false "unreachable").
+function geoFromComponents(comps: any[]): { country: string; state: string; city: string; suburb: string } {
+	const get = (t: string) => {
+		const c = comps.find((x) => (x.types || []).includes(t));
+		return c ? c.longText || c.shortText || "" : "";
+	};
+	return {
+		country: get("country"),
+		state: get("administrative_area_level_1"),
+		city: get("locality") || get("postal_town") || get("administrative_area_level_2"),
+		suburb: get("sublocality") || get("sublocality_level_1") || get("neighborhood") || "",
+	};
+}
+
+function classifyPhone(phone: string): string {
+	let d = (phone || "").replace(/\D/g, "");
+	if (!d) return "none";
+	if (d.startsWith("61")) d = "0" + d.slice(2);
+	if (d.startsWith("04") && d.length === 10) return "mobile";
+	if (/^0[2378]/.test(d) && d.length === 10) return "landline";
+	return "unknown";
+}
+function channelsFor(ptype: string, phone: string): string {
+	if (ptype === "mobile") return "Call · SMS · WhatsApp";
+	if (!phone) return "—";
+	return "Call";
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
 	const out: R[] = new Array(items.length);
 	let i = 0;
@@ -193,11 +310,9 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R
 	return out;
 }
 
-// Reachability, conservative: returns false (= a "site down" LEAD) ONLY on a definitive dead
-// signal (HTTP 404/410/5xx). Any other outcome — 2xx/3xx/401/403/429, a timeout, or a connection
-// error — is treated as reachable, so we never pitch "your site is down" to a business whose site
-// is actually fine (the earlier bug flagged ~75% of live sites). Browser UA + one retry + 12s.
-async function reachable(rawUrl: string): Promise<boolean> {
+// Conservative: ok=false (= a "site down" lead) ONLY on a definitive dead signal (404/410/5xx).
+// Timeouts / connection errors / other statuses → ok=true (don't false-flag). Returns the code for the audit.
+async function reachable(rawUrl: string): Promise<{ ok: boolean; code: number | null }> {
 	const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 	for (let attempt = 0; attempt < 2; attempt++) {
 		try {
@@ -207,11 +322,11 @@ async function reachable(rawUrl: string): Promise<boolean> {
 				headers: { "User-Agent": UA, Accept: "text/html,*/*" },
 				signal: AbortSignal.timeout(12000),
 			});
-			if (res.status === 404 || res.status === 410 || res.status >= 500) return false; // definitively dead
-			return true; // any other response → site is up
+			if (res.status === 404 || res.status === 410 || res.status >= 500) return { ok: false, code: res.status };
+			return { ok: true, code: res.status };
 		} catch {
-			if (attempt === 1) return true; // timeout / connection error → ambiguous, don't false-flag
+			if (attempt === 1) return { ok: true, code: null };
 		}
 	}
-	return true;
+	return { ok: true, code: null };
 }
